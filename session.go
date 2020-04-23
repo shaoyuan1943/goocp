@@ -45,6 +45,10 @@ func newSession(sc *ServerConn, conn net.PacketConn, addr net.Addr, state Client
 	return s
 }
 
+func (s *Session) ID() uint32 {
+	return s.id
+}
+
 func (s *Session) IsClient() bool {
 	return s.sc == nil
 }

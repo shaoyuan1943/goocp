@@ -1,2 +1,2 @@
 # goocp
-Reliable UDP development framework based on gokcp
+Sample and reliable UDP development framework based on gokcp

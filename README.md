@@ -1,5 +1,5 @@
 # goocp
-基于gokcp(https://github.com/shaoyuan1943/gokcp)实现的类Reactor模式的简单UDP会话管理。
+基于gokcp (https://github.com/shaoyuan1943/gokcp) 实现的类Reactor模式的简单UDP会话管理。
 
 goocp的实现相当简洁，它其实是在探索如何以更简洁、简单的方式编写网络部分的代码。近些年，网络代码在结构上被划分成Reactor模式与非Reactor模式，无论是哪种方式，多线程的代码必然会复杂。
 

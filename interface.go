@@ -10,3 +10,11 @@ type ClientConnState interface {
 	OnSendDataError(data []byte, err error)
 	OnNewDataComing(data []byte)
 }
+
+type PacketCrypto interface {
+	SetKey(key []byte)
+	SetLocalNonce(nonce []byte) error
+	GetLocalNonce() []byte
+	Encrypto(dst, src []byte) error
+	Decrypto(dst, src []byte) error
+}

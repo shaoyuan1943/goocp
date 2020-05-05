@@ -1,8 +1,9 @@
 package goocp
 
 import (
-	"context"
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,7 @@ import (
 )
 
 var convID uint32 = 1000
-var timeScheduler *TimerScheduler = NewTimerScheduler()
+var timerScheduler *TimerScheduler = NewTimerScheduler()
 
 type Session struct {
 	id           uint32
@@ -19,30 +20,44 @@ type Session struct {
 	remoteAddr   net.Addr
 	kcp          *gokcp.KCP
 	sc           *ServerConn
-	state        ClientConnState
-	err          error
+	stateHandler ClientConnState
 	writeNotifer chan struct{}
 	outPackets   [][]byte
-	ctx          context.Context
-	quitF        context.CancelFunc
-	mx           sync.Mutex
+	closedC      chan struct{}
+	mx           sync.RWMutex
+	closeOnce    sync.Once
+	codec        PacketCrypto
 }
 
-func newSessionFromServer(sc *ServerConn, conn net.PacketConn, addr net.Addr, client bool) *Session {
-	return newSession(sc, conn, addr, nil)
+func newSessionFromServer(convID uint32, sc *ServerConn, conn net.PacketConn, addr net.Addr) *Session {
+	return newSession(convID, sc, conn, addr, nil)
 }
 
-func newSession(sc *ServerConn, conn net.PacketConn, addr net.Addr, state ClientConnState) *Session {
+func newSession(convID uint32, sc *ServerConn, conn net.PacketConn, addr net.Addr, stateHandler ClientConnState) *Session {
 	s := &Session{}
-	s.id = atomic.AddUint32(&convID, 1)
+	s.id = convID
 	s.sc = sc
 	s.rwc = conn
 	s.remoteAddr = addr
-	s.state = state
-	s.ctx, s.quitF = context.WithCancel(context.Background())
+	s.stateHandler = stateHandler
+	s.closedC = make(chan struct{})
 	s.writeNotifer = make(chan struct{}, 1)
-	s.kcp = gokcp.NewKCP(s.id, s.dataOut)
+	s.kcp = gokcp.NewKCP(s.id, s.dataOutput)
+	s.kcp.SetBufferReserved(int(HEADER_SIZE))
+	s.kcp.SetNoDelay(true, 10, 2, true)
+
+	// to save goroutines
+	timerScheduler.PushTask(s.update, gokcp.CurrentMS())
+	go s.writeLoop()
+	go s.readLoop()
+
 	return s
+}
+
+func (s *Session) SetEncryptoCodec(codec PacketCrypto) {
+	if codec != nil {
+		s.codec = codec
+	}
 }
 
 func (s *Session) ID() uint32 {
@@ -53,17 +68,47 @@ func (s *Session) IsClient() bool {
 	return s.sc == nil
 }
 
-func (s *Session) SetClientConnState(state ClientConnState) {
-	if state != nil {
-		s.state = state
+func (s *Session) SetClientConnStateHandler(stateHandler ClientConnState) {
+	if stateHandler != nil {
+		s.stateHandler = stateHandler
 	}
 }
 
+func (s *Session) handleClose(err error) {
+	s.close(err, false)
+}
+
 func (s *Session) Close(err error) {
-	s.err = err
-	if s.sc != nil {
-		s.sc.notifyErrSession(s)
+	s.close(err, true)
+}
+
+func (s *Session) close(err error, sendClose bool) {
+	if s.rwc == nil {
+		return
 	}
+
+	s.closeOnce.Do(func() {
+		close(s.closedC)
+
+		if sendClose {
+			// send disconnect, ignore return error
+			data := make([]byte, int(gokcp.KCP_OVERHEAD)+int(HEADER_SIZE))
+			s.encodeData(data, HEADER_CMD_DISCONNECT)
+			s.rwc.WriteTo(data, s.remoteAddr)
+		}
+
+		if s.IsClient() {
+			s.rwc.Close()
+		}
+
+		if s.stateHandler != nil {
+			s.stateHandler.OnClosed(err)
+		}
+
+		if !s.IsClient() {
+			s.sc.notifyErrSession(s)
+		}
+	})
 }
 
 func (s *Session) onKCPDataComing(data []byte) error {
@@ -71,17 +116,39 @@ func (s *Session) onKCPDataComing(data []byte) error {
 		return errors.New("invalid recv data")
 	}
 
+	s.mx.Lock()
+	defer s.mx.Unlock()
+
 	return s.kcp.Input(data)
 }
 
-func (s *Session) dataOut(data []byte) {
+func (s *Session) encodeData(data []byte, cmd uint16) error {
+	binary.LittleEndian.PutUint16(data[12:], cmd)
+	sum := crc32.ChecksumIEEE(data[14:])
+	binary.LittleEndian.PutUint32(data[8:], sum)
+
+	if s.codec != nil {
+		return s.codec.Encrypto(data, data)
+	}
+
+	return nil
+}
+
+func (s *Session) dataOutput(data []byte) {
 	if len(data) == 0 || len(data) < int(gokcp.KCP_OVERHEAD) {
 		return
 	}
 
-	_, err := s.rwc.WriteTo(data, s.remoteAddr)
+	err := s.encodeData(data, HEADER_CMD_DATA)
 	if err != nil {
-		s.Close(err)
+		s.stateHandler.OnSendDataError(data, err)
+		return
+	}
+
+	_, err = s.rwc.WriteTo(data, s.remoteAddr)
+	if err != nil {
+		// if has error, kcp will resend this data in next update time
+		// TODO:?
 	}
 }
 
@@ -102,11 +169,90 @@ func (s *Session) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-func (s *Session) loop() {
+func (s *Session) readLoop() {
+	if !s.IsClient() {
+		return
+	}
+
+	buffer := make([]byte, s.kcp.Mtu()+150)
+	for {
+		select {
+		case <-s.closedC:
+			return
+		default:
+			n, addr, err := s.rwc.ReadFrom(buffer)
+			if err != nil {
+				s.close(err, true)
+				return
+			}
+
+			if addr.String() != s.remoteAddr.String() {
+				s.close(errors.New("different remote addr"), false)
+				return
+			}
+
+			err = s.handleData(buffer[:n])
+			if err != nil {
+				// if has error, remote kcp will resend data
+			}
+		}
+	}
+}
+
+func (s *Session) decodeData(data []byte) ([]byte, error) {
+	if s.codec != nil {
+		// 1. encrypto
+		err := s.codec.Decrypto(data, data)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// 2. check logic data(include kcp header) sum
+	sum1 := crc32.ChecksumIEEE(data[14:])
+	sum2 := binary.LittleEndian.Uint32(data[8:])
+	if sum1 != sum2 {
+		return nil, errors.New("different data sum")
+	}
+
+	return data[12:], nil
+}
+
+func (s *Session) handleData(buffer []byte) error {
+	data, err := s.decodeData(buffer)
+	if err != nil {
+		return err
+	}
+
+	// 3. check data cmd
+	cmd := binary.LittleEndian.Uint16(data)
+	if cmd == HEADER_CMD_DISCONNECT {
+		s.close(errors.New("remote connection closed"), false)
+		return nil
+	} else if cmd == HEADER_CMD_DATA {
+		data = data[2:]
+		convID := binary.LittleEndian.Uint32(data)
+		if convID == 0 {
+			return errors.New("invalid kcp data")
+		}
+
+		if s.kcp.ConvID() != convID {
+			return errors.New("unknow conversation ID")
+		}
+
+		return s.onKCPDataComing(data)
+	} else {
+		return errors.New("unknow data cmd")
+	}
+
+	return nil
+}
+
+func (s *Session) writeLoop() {
 	readedBuffer := make([]byte, gokcp.KCP_MTU_DEF+150)
 	for {
 		select {
-		case <-s.ctx.Done():
+		case <-s.closedC:
 			return
 		case <-s.writeNotifer:
 			waitSend := s.kcp.WaitSend()
@@ -119,10 +265,12 @@ func (s *Session) loop() {
 
 				for idx := range outPackets {
 					data := outPackets[idx]
+					s.mx.Lock()
 					err := s.kcp.Send(data)
+					s.mx.Unlock()
 					if err != nil {
-						if s.state != nil {
-							s.state.OnSendDataError(data, err)
+						if s.stateHandler != nil {
+							s.stateHandler.OnSendDataError(data, err)
 						}
 					}
 				}
@@ -130,24 +278,28 @@ func (s *Session) loop() {
 		default:
 			if !s.kcp.IsStreamMode() {
 				if size := s.kcp.PeekSize(); size > 0 {
+					s.mx.Lock()
 					n, err := s.kcp.Recv(readedBuffer)
+					s.mx.Unlock()
 					if err != nil {
 						if err == gokcp.ErrNoEnoughSpace {
 							readedBuffer = make([]byte, size)
 							break
 						}
 					} else {
-						if s.state != nil {
-							s.state.OnNewDataComing(readedBuffer[:n])
+						if s.stateHandler != nil {
+							s.stateHandler.OnNewDataComing(readedBuffer[:n])
 						}
 					}
 				}
 			} else {
 				for {
 					if size := s.kcp.PeekSize(); size > 0 {
+						s.mx.Lock()
 						n, err := s.kcp.Recv(readedBuffer)
-						if err == nil && s.state != nil {
-							s.state.OnNewDataComing(readedBuffer[:n])
+						s.mx.Unlock()
+						if err == nil && s.stateHandler != nil {
+							s.stateHandler.OnNewDataComing(readedBuffer[:n])
 						} else {
 							break
 						}
@@ -162,35 +314,24 @@ func (s *Session) loop() {
 
 func (s *Session) update() {
 	select {
-	case <-s.ctx.Done():
+	case <-s.closedC:
 		return
 	default:
 	}
 
+	s.mx.Lock()
 	s.kcp.Update()
+	s.mx.Unlock()
+
 	nextTime := s.kcp.Check()
-	timeScheduler.PushTask(s.update, nextTime)
+	timerScheduler.PushTask(s.update, nextTime)
 }
 
-func Dial(addr string, state ClientConnState) (*Session, error) {
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return nil, err
+func NewSession(conn net.PacketConn, addr *net.UDPAddr, stateHandler ClientConnState) *Session {
+	if conn == nil || addr == nil {
+		panic("invalid params")
 	}
 
-	network := "udp4"
-	if udpAddr.IP.To4() == nil {
-		network = "udp6"
-	}
-
-	udpConn, err := net.ListenUDP(network, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	s := newSession(nil, udpConn, udpAddr, state)
-	go s.loop()
-
-	timeScheduler.PushTask(s.update, 1)
-	return s, nil
+	s := newSession(atomic.AddUint32(&convID, 1), nil, conn, addr, stateHandler)
+	return s
 }
